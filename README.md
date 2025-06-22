@@ -88,11 +88,15 @@ python SubLingo_1.2.py
 Los archivos traducidos se guardan en:
 ```
 ./output_traducidos/
-├── archivo1_traducido.ass
+├── archivo1_traducido.es-419.ass
 ├── subcarpeta/
-│   └── archivo2_traducido.srt
+│   └── archivo2_traducido.es-419.srt
 └── ...
 ```
+
+El código de idioma (`es-419` en el ejemplo) se agrega al nombre de cada
+archivo para que herramientas como **MKVToolNix** detecten automáticamente
+el idioma.
 
 La estructura de carpetas original se mantiene intacta.
 

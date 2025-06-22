@@ -251,7 +251,14 @@ async def translate_file(path: Path, translator: GeminiTranslator, src_lang: str
     # Guardar
     out_path = OUTPUT_ROOT / path.relative_to(Path.cwd())
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    subs.save(out_path, encoding="utf-8", format_="ass" if path.suffix.lower() == ".ass" else "srt")
+
+    # Insertar el código de idioma en el nombre para que MKVToolNix lo detecte
+    out_path = out_path.with_name(f"{out_path.stem}.{tgt_lang}{out_path.suffix}")
+    subs.save(
+        out_path,
+        encoding="utf-8",
+        format_="ass" if path.suffix.lower() == ".ass" else "srt",
+    )
 
     progress.update(parent_task, advance=1)
 
