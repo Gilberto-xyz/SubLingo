@@ -140,22 +140,21 @@ def should_translate_line(ev: pysubs2.Event) -> bool:
 # ---------- GEMINI ---------------------------------------------------------
 
 class GeminiTranslator:
-    def __init__(self, api_key: str, model_name: str, narrative_ctx: str):
+    def __init__(self, api_key: str, model_name: str):
         if not api_key:
             raise ValueError("Se requiere API‑KEY de Gemini (env GEMINI_API_KEY).")
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model_name)
-        self.narrative_ctx = narrative_ctx
         console.print(Panel(f"[bold green]Proceso iniciado, Modelo usado:[/] {model_name}", expand=False))
 
     async def translate_batch(self, blocks: List[str], src_lang: str, tgt_lang: str) -> List[str]:
         """Traduce una lista de bloques y devuelve lista de traducciones."""
         prompt = (
-            f"Eres un traductor profesional. El texto forma parte de una serie descrita así: \n"
-            f"'''{self.narrative_ctx}'''\n\n"
-            f"Tareas: \n1. Traduce fielmente del idioma fuente ({src_lang}) al destino ({tgt_lang})\n"
-            "2. Respeta estilo, tono y emociones.\n"
-            "3. Devuelve sólo la traducción de cada bloque; separa bloques con DOS saltos de línea.\n\n"
+            "Eres un traductor profesional. Cada bloque incluye contexto antes y "
+            "después de la línea a traducir.\n"
+            f"Traduce únicamente la sección marcada como [LINEA] del idioma fuente ({src_lang}) al destino ({tgt_lang}).\n"
+            "Analiza primero el contexto para mantener coherencia y luego entrega solo la traducción de cada bloque,"
+            " separando las traducciones con DOS saltos de línea.\n\n"
             "## Bloques:\n" + "\n\n".join(blocks)
         )
         retries = 0
@@ -205,21 +204,38 @@ async def translate_file(path: Path, translator: GeminiTranslator, src_lang: str
         console.print(f"[red]No se pudo abrir {path}: {e}")
         return
 
-    # Mapeo de diálogos traducibles
+    # Mapeo de diálogos traducibles con contexto
+    dialog_positions = []
+    dialog_texts = []
+    for idx, ev in enumerate(subs):
+        if ev.type == "Dialogue":
+            dialog_positions.append(idx)
+            dialog_texts.append(ev.plaintext.strip())
+
     text_blocks = []
     indices = []
-    for i, ev in enumerate(subs):
-        if ev.type != "Dialogue" or not should_translate_line(ev):
+    for pos_idx, sub_idx in enumerate(dialog_positions):
+        ev = subs[sub_idx]
+        if not should_translate_line(ev):
             continue
-        # Doble‑origen:   {JP} EN
+
+        before = [dialog_texts[i] for i in range(max(0, pos_idx - 10), pos_idx)]
+        after = [dialog_texts[i] for i in range(pos_idx + 1, min(len(dialog_texts), pos_idx + 11))]
+
         m = re.match(r"\{([^}]+)\}\s*(.*)", ev.plaintext.strip())
         if m:
             jp, en_text = m.groups()
-            combo = f"[ORIG]{jp}\n[TRAD_INTERMEDIA]{en_text}"
-            text_blocks.append(combo.replace("\n", "\\n"))
+            line = f"[ORIG]{jp}\n[TRAD_INTERMEDIA]{en_text}"
         else:
-            text_blocks.append(ev.plaintext.strip().replace("\n", "\\n"))
-        indices.append(i)
+            line = ev.plaintext.strip()
+
+        block = (
+            "[ANTERIOR]\n" + "\n".join(b.replace("\n", " ") for b in before) +
+            "\n[LINEA]\n" + line.replace("\n", "\\n") +
+            "\n[POSTERIOR]\n" + "\n".join(a.replace("\n", " ") for a in after)
+        )
+        text_blocks.append(block)
+        indices.append(sub_idx)
 
     total_blocks = len(text_blocks)
     if not total_blocks:
@@ -281,13 +297,7 @@ async def main():
     start_time = time.time()  # <-- Agrega esto
     console.print(Panel("[bold magenta]SubLingo – Traductor de subtítulos – Versión 4.1[/]", expand=False))
 
-    # 1. Contexto narrativo
-    narrative_ctx = Prompt.ask(
-        "Describe brevemente la obra (serie, película, etc.) y su tono general",
-        default="Una historia con diálogos naturales y estilo narrativo neutral."
-    )
-
-    # 2. Buscar archivos
+    # 1. Buscar archivos
     files = find_subtitle_files(Path.cwd())
     if not files:
         console.print("[red]No se encontraron archivos de subtítulos (.ass o .srt) en la carpeta actual ni en subcarpetas.[/]")
@@ -301,7 +311,7 @@ async def main():
         parent = "(carpeta) " if f.parent != Path.cwd() else "(archivo) "
         console.print(f"{idx}. {parent}{f.relative_to(Path.cwd())}")
 
-    # 3. Detectar idioma base con el primer archivo
+    # 2. Detectar idioma base con el primer archivo
     detected_lang = detect_language_sample(files[0])
     lang_prompt = Prompt.ask(
         f"Idioma detectado en el primer archivo: [bold]{detected_lang}[/]. ¿Es correcto? (s/n o escribe el código ISO)",
@@ -312,11 +322,12 @@ async def main():
     else:
         src_lang = lang_prompt.lower().strip()
 
+    # 3. Definir idioma destino
     tgt_lang = Prompt.ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", default="es-419")
 
-    translator = GeminiTranslator(API_KEY, DEFAULT_MODEL_NAME, narrative_ctx)
+    translator = GeminiTranslator(API_KEY, DEFAULT_MODEL_NAME)
 
-    # 5. Progreso general
+    # 4. Progreso general
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
