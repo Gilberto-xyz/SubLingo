@@ -13,7 +13,7 @@
 ## ✨ Características Principales
 
 ### 🎯 Traducción Inteligente
-- **Contexto Narrativo**: Permite ingresar una descripción de la obra para mejorar la precisión y estilo de la traducción
+- **Análisis de Contexto**: Considera 10 líneas antes y 10 líneas después de cada diálogo para traducir con mayor precisión
 - **Detección Automática de Idioma**: Analiza el contenido y detecta automáticamente el idioma origen
 - **Soporte Doble Origen**: Maneja diálogos con formato `{texto_original} texto_traducido` para mayor precisión
 
@@ -65,9 +65,8 @@ python SubLingo_1.2.py
 
 ### Flujo de Trabajo
 
-1. **Contexto Narrativo**: 
-   - El programa te pedirá describir la obra (serie, película, etc.)
-   - Esto mejora la calidad y estilo de la traducción
+1. **Comprensión de Contexto**:
+   - Se analizan 10 líneas previas y 10 posteriores a cada diálogo para traducir con coherencia
 
 2. **Detección de Archivos**:
    - Busca automáticamente archivos `.ass` y `.srt` en la carpeta actual y subcarpetas
