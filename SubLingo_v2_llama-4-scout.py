@@ -60,10 +60,11 @@ from rich.prompt import Prompt, Confirm
 # ---------- CONFIGURACIÓN --------------------------------------------------
 API_KEY = os.getenv("CEREBRAS_API_KEY", "")  # Cargar desde .env
 DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
-BATCH_SIZE = 15
-MAX_RETRIES = 5
-INITIAL_BACKOFF_SECONDS = 5
-TIME_TOLERANCE_MS = 5     # ±5 ms se considera igual
+BATCH_SIZE = 100  # Tamaño del lote para procesamiento
+MAX_RETRIES = 10  # Número máximo de reintentos
+INITIAL_BACKOFF_SECONDS = 10  # Tiempo de espera inicial para reintentos
+TIME_TOLERANCE_MS = 20    # ±20 ms se considera igual
+BATCH_SLEEP_SECONDS = 10    # Espera entre lotes de traducción
 OUTPUT_ROOT = Path("output_traducidos")
 OUTPUT_ROOT.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
@@ -233,7 +234,7 @@ async def translate_file(path: Path, translator: CerebrasTranslator, src_lang: s
         translations.extend([t.replace("\\n", "\n") for t in translated_batch])
         progress.update(line_task, advance=len(batch))
         if i + BATCH_SIZE < total_blocks:
-            await asyncio.sleep(3)  # Espera proactiva entre lotes
+            await asyncio.sleep(BATCH_SLEEP_SECONDS)  # Espera proactiva entre lotes
 
     # Insertar en subs
     for idx, new_text in zip(indices, translations):
@@ -242,6 +243,33 @@ async def translate_file(path: Path, translator: CerebrasTranslator, src_lang: s
     # Validar
     original = pysubs2.load(path, encoding="utf-8")
     fixed_times, missing = validate_and_fix(original, subs)
+
+    # --- Nueva ronda para líneas no traducidas ---
+    if missing > 0:
+        untranslated_indices = []
+        untranslated_blocks = []
+        for i, (ev_o, ev_t) in enumerate(zip(original, subs)):
+            if ev_o.type != "Dialogue":
+                continue
+            if should_translate_line(ev_o) and (not ev_t.plaintext.strip() or ev_t.plaintext == ev_o.plaintext):
+                untranslated_indices.append(i)
+                untranslated_blocks.append(ev_o.plaintext.strip().replace("\n", "\\n"))
+        if untranslated_blocks:
+            console.print(f"[yellow]Intentando traducir {len(untranslated_blocks)} líneas faltantes en {path.name}...[/]")
+            # Traducir en lotes si son muchas
+            for i in range(0, len(untranslated_blocks), BATCH_SIZE):
+                batch = untranslated_blocks[i:i+BATCH_SIZE]
+                translated_batch = await translator.translate_batch(batch, src_lang, tgt_lang)
+                if len(translated_batch) != len(batch):
+                    translated_batch = [tb if k < len(translated_batch) else b for k, (tb, b) in enumerate(zip(translated_batch + batch, batch))]
+                for idx, new_text in zip(untranslated_indices[i:i+BATCH_SIZE], translated_batch):
+                    subs[idx].text = new_text.replace("\\n", "\n")
+                if i + BATCH_SIZE < len(untranslated_blocks):
+                    await asyncio.sleep(BATCH_SLEEP_SECONDS)
+            # Revalidar
+            fixed_times2, missing2 = validate_and_fix(original, subs)
+            fixed_times += fixed_times2
+            missing = missing2
 
     # Guardar
     out_path = OUTPUT_ROOT / path.relative_to(Path.cwd())
@@ -266,10 +294,50 @@ async def translate_file(path: Path, translator: CerebrasTranslator, src_lang: s
         border_style="blue",
         expand=False,
     )
-    # console.print(changes_panel)
     progress.console.log(changes_panel)
 
+    # --- Resumen de líneas no traducidas ---
+    if missing > 0:
+        untranslated_summary = []
+        for i, (ev_o, ev_t) in enumerate(zip(original, subs)):
+            if ev_o.type != "Dialogue":
+                continue
+            if should_translate_line(ev_o) and (not ev_t.plaintext.strip() or ev_t.plaintext == ev_o.plaintext):
+                motivo = "Posible canción/segmento no traducible" if any(word in ev_o.plaintext.lower() for word in ["♪", "♫", "music", "musica", "歌", "カラオケ"]) else "No traducido tras dos intentos"
+                untranslated_summary.append(f"Línea {i+1}: '{ev_o.plaintext.strip()[:60]}...'  [Motivo: {motivo}]")
+        if untranslated_summary:
+            resumen_panel = Panel(
+                "\n".join(untranslated_summary),
+                title=f"Líneas no traducidas en {path.name}",
+                border_style="red",
+                expand=False,
+            )
+            progress.console.log(resumen_panel)
 
+    # --- Resumen de líneas no traducidas con explicación del modelo ---
+    if missing > 0:
+        untranslated_summary = []
+        for i, (ev_o, ev_t) in enumerate(zip(original, subs)):
+            if ev_o.type != "Dialogue":
+                continue
+            if should_translate_line(ev_o) and (not ev_t.plaintext.strip() or ev_t.plaintext == ev_o.plaintext):
+                # Pedir explicación al modelo
+                prompt_explain = (
+                    f"A continuación se muestra una línea de subtítulo que no fue traducida: \n"
+                    f"'{ev_o.plaintext.strip()}'\n"
+                    "¿Por qué no se debe traducir esta línea? Si debe traducirse, responde: 'Debe traducirse'. Si no, explica brevemente el motivo (por ejemplo: es una canción, onomatopeya, nombre propio, etc.)."
+                )
+                explicacion = await translator.translate_batch([prompt_explain], src_lang, tgt_lang)
+                explicacion_str = explicacion[0] if explicacion else "Sin explicación del modelo"
+                untranslated_summary.append(f"Línea {i+1}: '{ev_o.plaintext.strip()[:60]}...'\n[Modelo]: {explicacion_str}")
+        if untranslated_summary:
+            resumen_panel = Panel(
+                "\n\n".join(untranslated_summary),
+                title=f"Líneas no traducidas en {path.name}",
+                border_style="red",
+                expand=False,
+            )
+            progress.console.log(resumen_panel)
 # ---------- MAIN -----------------------------------------------------------
 
 async def main():
