@@ -341,46 +341,55 @@ async def translate_file(path: Path, translator: CerebrasTranslator, src_lang: s
 # ---------- MAIN -----------------------------------------------------------
 
 async def main():
-    start_time = time.time()  # <-- Agrega esto
+    start_time = time.time()
     console.print(Panel("[bold magenta]SubLingo – Traductor de subtítulos – Versión 4.1[/]", expand=False))
 
-    # 1. Contexto narrativo
-    narrative_ctx = Prompt.ask(
-        "Describe brevemente la obra (serie, película, etc.) y su tono general",
-        default="Una historia con diálogos naturales y estilo narrativo neutral."
-    )
+    # --- Selección de modo ---
+    modo_auto = Confirm.ask("¿Deseas usar el modo automático? (acepta todos los valores por defecto)", default=False)
 
-    # 2. Buscar archivos
-    files = find_subtitle_files(Path.cwd())
-    if not files:
-        console.print("[red]No se encontraron archivos de subtítulos (.ass o .srt) en la carpeta actual ni en subcarpetas.[/]")
-        return
-
-    if len(files) == 1:
-        console.print("\n[bold]Archivo detectado para traducir:[/]")
+    if modo_auto:
+        narrative_ctx = "Una historia con diálogos naturales y estilo narrativo neutral."
+        files = find_subtitle_files(Path.cwd())
+        if not files:
+            console.print("[red]No se encontraron archivos de subtítulos (.ass o .srt) en la carpeta actual ni en subcarpetas.[/]")
+            return
+        src_lang = detect_language_sample(files[0])
+        tgt_lang = "es-419"
+        API_KEY = os.getenv("CEREBRAS_API_KEY", "")
+        DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
+        translator = CerebrasTranslator(API_KEY, DEFAULT_MODEL_NAME, narrative_ctx)
     else:
-        console.print(f"\n[bold]{len(files)} archivos detectados para traducir:[/]")
-    for idx, f in enumerate(files, 1):
-        parent = "(carpeta) " if f.parent != Path.cwd() else "(archivo) "
-        console.print(f"{idx}. {parent}{f.relative_to(Path.cwd())}")
-
-    # 3. Detectar idioma base con el primer archivo
-    detected_lang = detect_language_sample(files[0])
-    lang_prompt = Prompt.ask(
-        f"Idioma detectado en el primer archivo: [bold]{detected_lang}[/]. ¿Es correcto? (s/n o escribe el código ISO)",
-        default="s"
-    )
-    if lang_prompt.lower() in {"s", "sí", "si", "y", "yes"}:
-        src_lang = detected_lang
-    else:
-        src_lang = lang_prompt.lower().strip()
-
-    tgt_lang = Prompt.ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", default="es-419")
-
-    # Cambia aquí a CerebrasTranslator
-    API_KEY = os.getenv("CEREBRAS_API_KEY", "")
-    DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
-    translator = CerebrasTranslator(API_KEY, DEFAULT_MODEL_NAME, narrative_ctx)
+        # 1. Contexto narrativo
+        narrative_ctx = Prompt.ask(
+            "Describe brevemente la obra (serie, película, etc.) y su tono general",
+            default="Una historia con diálogos naturales y estilo narrativo neutral."
+        )
+        # 2. Buscar archivos
+        files = find_subtitle_files(Path.cwd())
+        if not files:
+            console.print("[red]No se encontraron archivos de subtítulos (.ass o .srt) en la carpeta actual ni en subcarpetas.[/]")
+            return
+        if len(files) == 1:
+            console.print("\n[bold]Archivo detectado para traducir:[/]")
+        else:
+            console.print(f"\n[bold]{len(files)} archivos detectados para traducir:[/]")
+        for idx, f in enumerate(files, 1):
+            parent = "(carpeta) " if f.parent != Path.cwd() else "(archivo) "
+            console.print(f"{idx}. {parent}{f.relative_to(Path.cwd())}")
+        # 3. Detectar idioma base con el primer archivo
+        detected_lang = detect_language_sample(files[0])
+        lang_prompt = Prompt.ask(
+            f"Idioma detectado en el primer archivo: [bold]{detected_lang}[/]. ¿Es correcto? (s/n o escribe el código ISO)",
+            default="s"
+        )
+        if lang_prompt.lower() in {"s", "sí", "si", "y", "yes"}:
+            src_lang = detected_lang
+        else:
+            src_lang = lang_prompt.lower().strip()
+        tgt_lang = Prompt.ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", default="es-419")
+        API_KEY = os.getenv("CEREBRAS_API_KEY", "")
+        DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
+        translator = CerebrasTranslator(API_KEY, DEFAULT_MODEL_NAME, narrative_ctx)
 
     # 5. Progreso general
     with Progress(
@@ -396,7 +405,7 @@ async def main():
             await translate_file(f, translator, src_lang, tgt_lang, progress, file_task)
 
     console.print(Panel("[bold green]Proceso terminado.[/]\nArchivos traducidos en ./output_traducidos", expand=False))
-    elapsed = time.time() - start_time  # <-- Agrega esto
+    elapsed = time.time() - start_time
     mins, secs = divmod(int(elapsed), 60)
     console.print(f"[cyan]Tiempo de ejecución: {mins} min {secs} s[/]")
 
