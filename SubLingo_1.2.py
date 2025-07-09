@@ -144,39 +144,67 @@ class GeminiTranslator:
         if not api_key:
             raise ValueError("Se requiere API‑KEY de Gemini (env GEMINI_API_KEY).")
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
+        # Dos instancias para simular dos agentes: uno para contexto y otro para traducción
+        self.context_model = genai.GenerativeModel(model_name)
+        self.trans_model = genai.GenerativeModel(model_name)
         console.print(Panel(f"[bold green]Proceso iniciado, Modelo usado:[/] {model_name}", expand=False))
 
-    async def translate_batch(self, blocks: List[str], src_lang: str, tgt_lang: str) -> List[str]:
-        """Traduce una lista de bloques y devuelve lista de traducciones."""
-        prompt = (
-            "Eres un traductor profesional. Cada bloque incluye contexto antes y "
-            "después de la línea a traducir.\n"
-            f"Traduce únicamente la sección marcada como [LINEA] del idioma fuente ({src_lang}) al destino ({tgt_lang}).\n"
-            "Analiza primero el contexto para mantener coherencia y luego entrega solo la traducción de cada bloque,"
-            " separando las traducciones con DOS saltos de línea.\n\n"
-            "## Bloques:\n" + "\n\n".join(blocks)
-        )
+    async def _generate(self, model, prompt: str, temperature: float = 0.7) -> str:
+        """Llama al modelo con reintentos y devuelve el texto generado."""
         retries = 0
         while retries < MAX_RETRIES:
             try:
-                resp = await self.model.generate_content_async(
+                resp = await model.generate_content_async(
                     [prompt],
-                    generation_config=genai.types.GenerationConfig(temperature=0.7),
+                    generation_config=genai.types.GenerationConfig(temperature=temperature),
                     safety_settings=[{"category": c, "threshold": "BLOCK_NONE"} for c in (
-                        "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")]
+                        "HARM_CATEGORY_HARASSMENT",
+                        "HARM_CATEGORY_HATE_SPEECH",
+                        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    )],
                 )
-                text = getattr(resp, "text", "") or "".join(p.text for p in resp.parts if hasattr(p, "text"))
-                return [t.strip() for t in text.strip().split("\n\n")]
-            except ResourceExhausted as e:
+                return (
+                    getattr(resp, "text", "")
+                    or "".join(p.text for p in resp.parts if hasattr(p, "text"))
+                ).strip()
+            except ResourceExhausted:
                 retries += 1
                 delay = INITIAL_BACKOFF_SECONDS * (2 ** (retries - 1))
-                console.print(f"[yellow]Cuota agotada, reintento {retries}/{MAX_RETRIES} en {delay}s…[/]")
+                console.print(
+                    f"[yellow]Cuota agotada, reintento {retries}/{MAX_RETRIES} en {delay}s…[/]"
+                )
                 sleep_with_progress(delay, "Back‑off Gemini")
             except Exception as e:
                 console.print(f"[red]Error Gemini:[/] {e}")
-                return []
-        return []
+                return ""
+        return ""
+
+    async def translate_batch(
+        self, blocks: List[Tuple[str, str]], src_lang: str, tgt_lang: str
+    ) -> List[str]:
+        """Traduce una lista de (contexto, línea) y devuelve solo las traducciones."""
+        results: List[str] = []
+        for context, line in blocks:
+            # 1. Analizar contexto con el primer agente
+            context_prompt = (
+                "Analiza el siguiente contexto de subtítulos en "
+                f"{src_lang} y resúmelo brevemente para ayudar a la traducción:\n\n{context}"
+            )
+            summary = await self._generate(self.context_model, context_prompt, temperature=0.5)
+
+            # 2. Traducir la línea usando el resumen obtenido
+            translation_prompt = (
+                "Eres un traductor profesional. Usa el resumen de contexto para "
+                "traducir únicamente la línea proporcionada.\n"
+                f"Resumen: {summary}\n"
+                f"Línea ({src_lang}): {line}\n\n"
+                f"Devuelve solo la traducción al {tgt_lang}."
+            )
+            translated = await self._generate(self.trans_model, translation_prompt, temperature=0.7)
+            results.append(translated)
+
+        return results
 
 # ---------- VALIDACIÓN -----------------------------------------------------
 
@@ -212,7 +240,7 @@ async def translate_file(path: Path, translator: GeminiTranslator, src_lang: str
             dialog_positions.append(idx)
             dialog_texts.append(ev.plaintext.strip())
 
-    text_blocks = []
+    text_blocks: List[Tuple[str, str]] = []
     indices = []
     for pos_idx, sub_idx in enumerate(dialog_positions):
         ev = subs[sub_idx]
@@ -229,12 +257,8 @@ async def translate_file(path: Path, translator: GeminiTranslator, src_lang: str
         else:
             line = ev.plaintext.strip()
 
-        block = (
-            "[ANTERIOR]\n" + "\n".join(b.replace("\n", " ") for b in before) +
-            "\n[LINEA]\n" + line.replace("\n", "\\n") +
-            "\n[POSTERIOR]\n" + "\n".join(a.replace("\n", " ") for a in after)
-        )
-        text_blocks.append(block)
+        context = "\n".join(before + after)
+        text_blocks.append((context, line.replace("\n", "\\n")))
         indices.append(sub_idx)
 
     total_blocks = len(text_blocks)
@@ -248,9 +272,10 @@ async def translate_file(path: Path, translator: GeminiTranslator, src_lang: str
     for i in range(0, total_blocks, BATCH_SIZE):
         batch = text_blocks[i:i+BATCH_SIZE]
         translated_batch = await translator.translate_batch(batch, src_lang, tgt_lang)
-        # Normalizar tamaño
+        # Normalizar tamaño por si falta alguna traducción
         if len(translated_batch) != len(batch):
-            translated_batch = [tb if k < len(translated_batch) else b for k, (tb, b) in enumerate(zip(translated_batch + batch, batch))]
+            for k in range(len(translated_batch), len(batch)):
+                translated_batch.append(batch[k][1])
         translations.extend([t.replace("\\n", "\n") for t in translated_batch])
         progress.update(line_task, advance=len(batch))
         if i + BATCH_SIZE < total_blocks:
