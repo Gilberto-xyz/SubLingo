@@ -60,7 +60,7 @@ from rich.prompt import Prompt, Confirm
 # ---------- CONFIGURACIÓN --------------------------------------------------
 API_KEY = os.getenv("CEREBRAS_API_KEY", "")  # Cargar desde .env
 DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
-BATCH_SIZE = 100  # Tamaño del lote para procesamiento
+BATCH_SIZE = 1000  # Tamaño del lote para procesamiento
 MAX_RETRIES = 10  # Número máximo de reintentos
 INITIAL_BACKOFF_SECONDS = 10  # Tiempo de espera inicial para reintentos
 TIME_TOLERANCE_MS = 20    # ±20 ms se considera igual
