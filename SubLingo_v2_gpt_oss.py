@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SubLingo_v2_llama-4-scout.py
+"""SubLingo_v2_gpt_oss.py
 ------------------------------------------------
 Versión mejorada con optimizaciones especiales para japonés:
 1. Contexto narrativo ingresado por el usuario (mejora de estilo).
@@ -26,7 +26,7 @@ Requisitos:
     pip install pysubs2 rich langdetect cerebras-cloud-sdk python-dotenv
 
 Uso:
-    python3 SubLingo_v2_llama-4-scout.py
+    python3 SubLingo_v2_gpt_oss.py
 
 Todos los archivos traducidos se guardan en la carpeta ./output_traducidos
 con la misma estructura de carpetas que la original.
@@ -65,7 +65,7 @@ from rich.prompt import Prompt, Confirm
 
 # ---------- CONFIGURACIÓN --------------------------------------------------
 API_KEY = os.getenv("CEREBRAS_API_KEY", "")  # Cargar desde .env
-DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
+DEFAULT_MODEL_NAME = "gpt-oss-120b"
 BATCH_SIZE = 100  # Tamaño del lote para procesamiento
 MAX_RETRIES = 10  # Número máximo de reintentos
 INITIAL_BACKOFF_SECONDS = 10  # Tiempo de espera inicial para reintentos
@@ -215,9 +215,10 @@ class CerebrasTranslator:
                 messages=messages,
                 model=self.model_name,
                 stream=True,
-                max_completion_tokens=2048,
+                max_completion_tokens=65_536,
                 temperature=0.2,
-                top_p=1
+                top_p=1,
+                reasoning_effort="high"## Opcional: "low", "medium", "high"
             )
             output = ""
             # Cerebras SDK no es async, así que usamos run_in_executor
