@@ -217,8 +217,9 @@ class CerebrasTranslator:
                 stream=True,
                 max_completion_tokens=65_536,
                 temperature=0.2,
-                top_p=1,
-                reasoning_effort="high"## Opcional: "low", "medium", "high"
+                top_p=1, 
+                reasoning_effort="high"
+                # reasoning_effort="high"## Opcional: "low", "medium", "high"
             )
             output = ""
             # Cerebras SDK no es async, así que usamos run_in_executor
@@ -250,6 +251,50 @@ def validate_and_fix(original: pysubs2.SSAFile, translated: pysubs2.SSAFile) -> 
         if should_translate_line(ev_o) and (not ev_t.plaintext.strip() or ev_t.plaintext == ev_o.plaintext):
             retrad_needed += 1
     return corr_times, retrad_needed
+
+# ---------- VALIDACIÓN ESTRUCTURAL LIGERA ----------------------------------
+import random  # <-- encabezado del archivo
+
+def sample_structure_check(
+        original: pysubs2.SSAFile,
+        translated: pysubs2.SSAFile,
+        samples: int = 10,
+        tol_ms: int = TIME_TOLERANCE_MS) -> list[str]:
+    """
+    Revisa que la estructura general se conserve tomando 'samples' checkpoints.
+    Devuelve una lista de mensajes de error (vacía = todo ok).
+    """
+    issues = []
+
+    # 0. Conteo de eventos
+    if len(original) != len(translated):
+        issues.append(f"Cantidad de eventos distinta: "
+                      f"orig={len(original)} vs trad={len(translated)}")
+
+    # 1. Muestreo cada ~10 %
+    step = max(len(original) // samples, 1)
+    for idx in range(0, len(original), step):
+        if idx >= len(translated):
+            issues.append(f"Bloque {idx+1} falta en traducido.")
+            continue
+
+        o, t = original[idx], translated[idx]
+
+        # 1a. Tiempos
+        if abs(o.start - t.start) > tol_ms or abs(o.end - t.end) > tol_ms:
+            issues.append(f"Tiempos desfasados en bloque {idx+1} "
+                          f"({o.start}->{t.start} ms)")
+
+        # 1b. Semejanza de texto
+        ratio = difflib.SequenceMatcher(None,
+                                        o.plaintext.strip(),
+                                        t.plaintext.strip()).ratio()
+        if ratio < 0.30:  # muy diferente
+            issues.append(f"Contenido muy diferente en bloque {idx+1} "
+                          f"(sim={ratio:.2f})")
+
+    return issues
+
 
 # ---------- TRADUCCIÓN DE UN ARCHIVO ---------------------------------------
 
@@ -312,6 +357,19 @@ async def translate_file(path: Path, translator: CerebrasTranslator, src_lang: s
     # Validar
     original = pysubs2.load(path, encoding="utf-8")
     fixed_times, missing = validate_and_fix(original, subs)
+    # Chequeo estadístico de estructura
+    structural_issues = sample_structure_check(original, subs)
+    if structural_issues:
+        panel = Panel(
+            "\n".join(structural_issues),
+            title="Chequeo de estructura (10 %)",
+            border_style="yellow",
+            expand=False,
+        )
+        progress.console.log(panel)
+        # Si quieres detener el proceso automáticamente:
+        # raise ValueError("Estructura incoherente; abortando guardado.")
+
 
     # --- Nueva ronda para líneas no traducidas ---
     if missing > 0:
@@ -452,7 +510,7 @@ async def main():
         src_lang = detect_language_sample(files[0])
         tgt_lang = "es-419"
         API_KEY = os.getenv("CEREBRAS_API_KEY", "")
-        DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
+        DEFAULT_MODEL_NAME = "gpt-oss-120b"
         translator = CerebrasTranslator(API_KEY, DEFAULT_MODEL_NAME, narrative_ctx)
     else:
         # 1. Contexto narrativo
@@ -484,7 +542,7 @@ async def main():
             src_lang = lang_prompt.lower().strip()
         tgt_lang = Prompt.ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", default="es-419")
         API_KEY = os.getenv("CEREBRAS_API_KEY", "")
-        DEFAULT_MODEL_NAME = "llama-4-scout-17b-16e-instruct"
+        DEFAULT_MODEL_NAME = "gpt-oss-120b"
         translator = CerebrasTranslator(API_KEY, DEFAULT_MODEL_NAME, narrative_ctx)
 
     # 5. Progreso general
