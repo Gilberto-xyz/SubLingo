@@ -218,7 +218,7 @@ class CerebrasTranslator:
                 max_completion_tokens=65_536,
                 temperature=0.2,
                 top_p=1, 
-                reasoning_effort="high"
+                reasoning_effort="low"
                 # reasoning_effort="high"## Opcional: "low", "medium", "high"
             )
             output = ""
