@@ -84,7 +84,7 @@ def quick_lang_detect(text: str) -> str:
         return "ja"
     # Heurística simple: contiene muchas palabras comunes del inglés
     en_tokens = sum(w in {"the","and","you","what","is","are","not","i","it","to"} for w in re.findall(r"[a-zA-Z']+", text.lower()))
-    return "en" if en_tokens >= 1 else "es"
+    return "en" if en_tokens >= 1 else "es-419"
 
 # Selecciona líneas a traducir (evita URLs/creditos)
 def should_translate(text: str) -> bool:
@@ -236,14 +236,21 @@ async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str, n
         return 0, 0
 
     # Bloques de texto de origen
-    src_blocks, idxs = [], []
-    for i,ev in enumerate(subs):
+    src_blocks, assembly = [], []  # src_blocks: sublíneas; assembly: [(idx_evento, num_sublíneas, prefijos)]
+    for i, ev in enumerate(subs):
         if ev in events:
-            txt = ev.plaintext.strip()
-            if src_lang == "ja":  # normalizar furigana: 漢字(ふり) → 漢字
-                txt = re.sub(r'([\u4E00-\u9FAF]+)\([\u3040-\u309F]+\)', r'\1', txt)
-            src_blocks.append(txt)
-            idxs.append(i)
+            raw = ev.plaintext.replace("\r\n", "\n").replace("\r", "\n").strip()
+            parts = raw.split("\n")
+
+            prefixes = []   # p.ej. ["- ", "", "- "]
+            clean = []      # sublíneas sin el prefijo (para que el modelo no lo borre)
+            for p in parts:
+                m = re.match(r'^(\s*[-–—•]\s+)?(.*)$', p)
+                prefixes.append(m.group(1) or "")
+                clean.append(m.group(2))
+            assembly.append((i, len(parts), prefixes))
+            src_blocks.extend(clean)
+
 
     banner(f"Proceso iniciado, Modelo usado: {MODEL_NAME}")
     translator = TranslatorAgent(LLM(os.getenv("CEREBRAS_API_KEY"), MODEL_NAME), narrative)
@@ -263,11 +270,29 @@ async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str, n
     # Pasada 2: reparación por el validador
     out_blocks = await validator.repair(src_blocks, out_blocks, src_lang, tgt_lang)
 
-    # Escribir back
+    # Escribir back  (MULTILINE-FIX: rearmar eventos multilinea)
     missing = 0
-    for idx, new in zip(idxs, out_blocks):
-        if not new.strip(): missing += 1
-        subs[idx].text = new.strip() or subs[idx].plaintext.strip()  # nunca vacío en archivo
+    pos = 0
+    for idx_event, count, prefixes in assembly:
+        lines = []
+        for j in range(count):
+            out_line = (out_blocks[pos + j] if pos + j < len(out_blocks) else "").strip()
+            src_line = (src_blocks[pos + j] if pos + j < len(src_blocks) else "").strip()
+
+            if not out_line:
+                # cuenta como faltante y caemos al original limpio (sublínea)
+                missing += 1
+                out_line = src_line
+
+            # Si la original tenía guion/prefijo y la traducción no, lo restauramos
+            if prefixes[j] and not re.match(r'^\s*[-–—•]\s+', out_line):
+                out_line = prefixes[j] + out_line
+
+            lines.append(out_line)
+        pos += count
+
+        # Unir con salto de línea real dentro del mismo evento SRT
+        subs[idx_event].text = "\n".join(lines)
 
     # Guardar
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -314,7 +339,7 @@ async def main():
 
     tgt_lang = ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", "es-419").strip()
 
-    console.print(Panel.fit(f"Proceso iniciado, Modelo usado: {MODEL_NAME}", border_style="magenta"))
+    # console.print(Panel.fit(f"Proceso iniciado, Modelo usado: {MODEL_NAME}", border_style="magenta"))
 
     total_t0 = start_time()
     llm = LLM(os.getenv("CEREBRAS_API_KEY"), MODEL_NAME)
