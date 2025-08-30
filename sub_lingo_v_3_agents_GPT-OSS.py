@@ -37,7 +37,9 @@ except Exception:
 MODEL_NAME   = os.getenv("SUBLINGO_MODEL", "gpt-oss-120b")
 BATCH_SIZE   = int(os.getenv("SUBLINGO_BATCH", 120))
 SLEEP        = float(os.getenv("SUBLINGO_SLEEP", 0.15))
-OUTPUT_ROOT  = Path(os.getenv("SUBLINGO_OUT", "output_traducidos")).resolve()
+# Carpeta de trabajo única para entradas y salidas
+SUBS_DIR     = Path(os.getenv("SUBS_BULK_DIR", "SUBS_BULK")).resolve()
+OUTPUT_ROOT  = Path(os.getenv("SUBLINGO_OUT", str(SUBS_DIR))).resolve()
 SHOW_HEADER  = True
 
 # Cargar .env si existe (sin dependencia obligatoria)
@@ -230,30 +232,93 @@ class ValidatorAgent:
 # -------------------------- Núcleo de proceso --------------------------
 async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str, narrative: str):
     subs = pysubs2.load(path, encoding="utf-8")
+    is_ass = path.suffix.lower() == ".ass"
+
+    # Solo consideramos eventos de diálogo con texto traducible (según heurística)
     events = [ev for ev in subs if ev.type == "Dialogue" and should_translate(ev.plaintext)]
     if not events:
         console.print(f"[yellow]No hay diálogos traducibles en {path.name}[/]")
         return 0, 0
 
-    # Bloques de texto de origen
-    src_blocks, assembly = [], []  # src_blocks: sublíneas; assembly: [(idx_evento, num_sublíneas, prefijos)]
-    for i, ev in enumerate(subs):
-        if ev in events:
-            raw = ev.plaintext.replace("\r\n", "\n").replace("\r", "\n").strip()
-            parts = raw.split("\n")
+    # --- Utilidades ASS ---
+    def tokenize_ass_text(text: str):
+        r"""Divide el campo 'Text' de ASS en tokens: {tags}, \N/\n y texto visible.
+        Devuelve lista de tuplas (tipo, valor).
+        """
+        tokens = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "{":
+                j = text.find("}", i + 1)
+                if j == -1:
+                    tokens.append(("text", text[i:]))
+                    break
+                tokens.append(("tag", text[i:j+1]))
+                i = j + 1
+                continue
+            if ch == "\\" and i + 1 < n and text[i+1] in ("N", "n"):
+                tokens.append(("newline", text[i:i+2]))
+                i += 2
+                continue
+            # Acumular texto visible hasta el siguiente tag o salto \N
+            j = i
+            while j < n and text[j] != "{" and not (text[j] == "\\" and j + 1 < n and text[j+1] in ("N", "n")):
+                j += 1
+            tokens.append(("text", text[i:j]))
+            i = j
+        return tokens
 
-            prefixes = []   # p.ej. ["- ", "", "- "]
-            clean = []      # sublíneas sin el prefijo (para que el modelo no lo borre)
-            for p in parts:
-                m = re.match(r'^(\s*[-–—•]\s+)?(.*)$', p)
-                prefixes.append(m.group(1) or "")
-                clean.append(m.group(2))
-            assembly.append((i, len(parts), prefixes))
-            src_blocks.extend(clean)
+    # --- Recolección de bloques a traducir y mapeo para reconstrucción ---
+    src_blocks = []
+    missing = 0
+
+    if is_ass:
+        # Estructura: [(idx_evento, [token_objs])]
+        # token_obj para texto: {type:'text', prefix:str, content:str, block_idx:int|None}
+        # para tag/newline: {type:'tag'|'newline', text:str}
+        assembly_ass = []
+        for i, ev in enumerate(subs):
+            if ev in events:
+                toks = tokenize_ass_text(ev.text)
+                token_objs = []
+                for ttype, tval in toks:
+                    if ttype == "text":
+                        # Puede ser vacío o solo espacios
+                        # Preservar prefijos tipo "- "
+                        m = re.match(r"^(\s*[-–—•]\s+)?(.*)$", tval, re.S)
+                        prefix = m.group(1) or ""
+                        content = (m.group(2) or "")
+                        # Si no hay nada sustancial, no traducimos
+                        if should_translate(content):
+                            block_idx = len(src_blocks)
+                            src_blocks.append(content)
+                        else:
+                            block_idx = None
+                        token_objs.append({"type": "text", "prefix": prefix, "content": content, "block_idx": block_idx})
+                    elif ttype == "tag":
+                        token_objs.append({"type": "tag", "text": tval})
+                    else:  # newline
+                        token_objs.append({"type": "newline", "text": tval})
+                assembly_ass.append((i, token_objs))
+    else:
+        # SRT: se traduce por sublíneas manteniendo prefijos de guion
+        assembly = []  # [(idx_evento, num_sublíneas, prefijos)]
+        for i, ev in enumerate(subs):
+            if ev in events:
+                raw = ev.plaintext.replace("\r\n", "\n").replace("\r", "\n").strip()
+                parts = raw.split("\n")
+                prefixes, clean = [], []
+                for p in parts:
+                    m = re.match(r'^(\s*[-–—•]\s+)?(.*)$', p)
+                    prefixes.append(m.group(1) or "")
+                    clean.append(m.group(2))
+                assembly.append((i, len(parts), prefixes))
+                src_blocks.extend(clean)
 
 
     banner(f"Proceso iniciado, Modelo usado: {MODEL_NAME}")
-    translator = TranslatorAgent(LLM(os.getenv("CEREBRAS_API_KEY"), MODEL_NAME), narrative)
+    translator = TranslatorAgent(llm, narrative)
     validator  = ValidatorAgent(translator)
 
     # Pasada 1: traducción normal
@@ -270,38 +335,59 @@ async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str, n
     # Pasada 2: reparación por el validador
     out_blocks = await validator.repair(src_blocks, out_blocks, src_lang, tgt_lang)
 
-    # Escribir back  (MULTILINE-FIX: rearmar eventos multilinea)
-    missing = 0
-    pos = 0
-    for idx_event, count, prefixes in assembly:
-        lines = []
-        for j in range(count):
-            out_line = (out_blocks[pos + j] if pos + j < len(out_blocks) else "").strip()
-            src_line = (src_blocks[pos + j] if pos + j < len(src_blocks) else "").strip()
+    # Escribir back
+    if is_ass:
+        # Reconstruir cada evento manteniendo tags y posiciones
+        for idx_event, token_objs in assembly_ass:
+            rendered = []
+            for tok in token_objs:
+                if tok["type"] in {"tag", "newline"}:
+                    rendered.append(tok["text"])
+                else:  # texto visible
+                    block_idx = tok["block_idx"]
+                    prefix = tok["prefix"]
+                    if block_idx is None:
+                        # No traducible; dejamos como estaba
+                        rendered.append(prefix + tok["content"])
+                        continue
+                    out_line = (out_blocks[block_idx] if block_idx < len(out_blocks) else "").strip()
+                    src_line = (src_blocks[block_idx] if block_idx < len(src_blocks) else "").strip()
+                    if not out_line:
+                        missing += 1
+                        out_line = src_line
+                    # Restaurar prefijo si se perdió
+                    if prefix and not re.match(r'^\s*[-–—•]\s+', out_line):
+                        out_line = prefix + out_line
+                    else:
+                        out_line = prefix + out_line
+                    rendered.append(out_line)
+            subs[idx_event].text = "".join(rendered)
+    else:
+        # SRT: rearmar multilínea
+        pos = 0
+        for idx_event, count, prefixes in assembly:
+            lines = []
+            for j in range(count):
+                out_line = (out_blocks[pos + j] if pos + j < len(out_blocks) else "").strip()
+                src_line = (src_blocks[pos + j] if pos + j < len(src_blocks) else "").strip()
+                if not out_line:
+                    missing += 1
+                    out_line = src_line
+                if prefixes[j] and not re.match(r'^\s*[-–—•]\s+', out_line):
+                    out_line = prefixes[j] + out_line
+                lines.append(out_line)
+            pos += count
+            subs[idx_event].text = "\n".join(lines)
 
-            if not out_line:
-                # cuenta como faltante y caemos al original limpio (sublínea)
-                missing += 1
-                out_line = src_line
-
-            # Si la original tenía guion/prefijo y la traducción no, lo restauramos
-            if prefixes[j] and not re.match(r'^\s*[-–—•]\s+', out_line):
-                out_line = prefixes[j] + out_line
-
-            lines.append(out_line)
-        pos += count
-
-        # Unir con salto de línea real dentro del mismo evento SRT
-        subs[idx_event].text = "\n".join(lines)
-
-    # Guardar
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_ROOT / (path.stem + f".{tgt_lang}" + path.suffix)
-    subs.save(out_path, encoding="utf-8", format_="srt")
+    # Guardar con el formato original, en subcarpeta dentro de SUBS_BULK
+    out_dir = SUBS_DIR / "TRADUCIDOS" / tgt_lang
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / (path.stem + f".{tgt_lang}" + path.suffix)
+    subs.save(out_path, encoding="utf-8", format_=("ass" if is_ass else "srt"))
 
     # Reporte
     console.log(Panel(
-        f"[bold]{path.name}[/]\nTiempos corregidos : [cyan]0[/]\nLíneas sin traducir : [cyan]{missing}[/]",
+        f"[bold]{path.name}[/]\nGuardado en: [green]{out_path}[/]\nTiempos corregidos : [cyan]0[/]\nLíneas sin traducir : [cyan]{missing}[/]",
         title="Resultado", border_style="blue", expand=False
     ))
     return 0, missing
@@ -313,22 +399,38 @@ def gather_files(cwd: Path) -> List[Path]:
 async def main():
     console.print(Panel.fit("SubLingo – Traductor de subtítulos – Versión 5.0", border_style="cyan"))
 
+    # Asegurar carpeta de trabajo única
+    SUBS_DIR.mkdir(parents=True, exist_ok=True)
+
     auto = ask("¿Deseas usar el modo automático? (acepta todos los valores por defecto) [y/n]", "n").lower().startswith("y")
     narrative = "Una historia con diálogos naturales y estilo narrativo neutral."
     if not auto:
         narrative = ask("Describe brevemente la obra (serie, película, etc.) y su tono general", narrative)
 
-    files = gather_files(Path.cwd())
+    files = gather_files(SUBS_DIR)
     if not files:
-        console.print("[red]No se hallaron archivos .srt/.ass en la carpeta actual.[/]")
+        console.print(f"[red]No se hallaron archivos .srt/.ass en la carpeta: {SUBS_DIR}[/]")
+        console.print("[dim]Coloca los subtítulos fuente en esa carpeta e intenta de nuevo.[/]")
         return
 
-    console.print("\n[bold]Archivo(s) detectado(s) para traducir:[/]")
+
+    # Primero preguntar el idioma destino para filtrar posibles ya traducidos
+    tgt_lang = ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", "es-419").strip()
+
+    # Filtrar archivos que aparentan ya estar traducidos al destino seleccionado
+    def looks_translated(p: Path) -> bool:
+        # Coincide con sufijo ".<tgt><ext>", ej. movie.es-419.ass
+        return p.name.endswith(f".{tgt_lang}{p.suffix}")
+    files = [f for f in files if not looks_translated(f)]
+    if not files:
+        console.print(f"[yellow]No hay archivos fuente por procesar en {SUBS_DIR} (ya existen traducciones a {tgt_lang}).[/]")
+        return
+
+    console.print("\n[bold]Archivo(s) a procesar:[/]")
     for i, f in enumerate(files, 1):
         console.print(f"{i}. {f.name}")
 
-
-    # Detección de idioma fuente
+    # Detección de idioma fuente usando el primer archivo post-filtrado
     sample_text = "".join([ev.plaintext for ev in pysubs2.load(files[0], encoding="utf-8") if ev.type=="Dialogue"])[:2000]
     src_guess = quick_lang_detect(sample_text)
     src_ans = ask(f"Idioma detectado en el primer archivo: {src_guess}. ¿Es correcto? (s/n o escribe el código ISO)", "s")
@@ -336,8 +438,6 @@ async def main():
         src_lang = src_ans.strip() or src_guess
     else:
         src_lang = src_guess
-
-    tgt_lang = ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", "es-419").strip()
 
     # console.print(Panel.fit(f"Proceso iniciado, Modelo usado: {MODEL_NAME}", border_style="magenta"))
 
