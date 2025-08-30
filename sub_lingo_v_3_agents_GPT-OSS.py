@@ -71,9 +71,16 @@ def fmt_duration(sec: float) -> str:
 
 
 # --------------------------- Utilidades CLI ---------------------------
+def color_lang(lang: str, style: str = "bold magenta") -> str:
+    """Devuelve el código de idioma con estilo Rich para resaltar."""
+    return f"[{style}]{lang}[/]"
+
 def ask(msg: str, default: str|None=None) -> str:
+    """Imprime el mensaje con Rich (permitiendo colores) y lee input."""
     prompt = f"{msg} " + (f"({default}): " if default is not None else ": ")
-    ans = input(prompt).strip()
+    # Mostrar el prompt con soporte de estilos y leer en la misma línea
+    console.print(prompt, end="")
+    ans = input().strip()
     return ans or (default or "")
 
 def banner(title: str):
@@ -230,7 +237,24 @@ class ValidatorAgent:
         return out_blocks
 
 # -------------------------- Núcleo de proceso --------------------------
-async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str, narrative: str):
+def derive_narrative_from_filename(path: Path) -> str:
+    """Genera un contexto breve usando el nombre del archivo.
+    Limpia artefactos comunes (separadores y etiquetas) para usarlo como título.
+    """
+    name = path.stem
+    # Elimina segmentos entre [] o () típicos de releases
+    name = re.sub(r"\[.*?\]|\(.*?\)", " ", name)
+    # Reemplaza separadores comunes por espacios
+    name = re.sub(r"[._-]+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if not name:
+        name = path.stem
+    return (
+        f"Título/archivo: '{name}'. Usa este título como contexto de la obra "
+        f"para mantener coherencia de nombres propios, terminología y tono."
+    )
+
+async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str):
     subs = pysubs2.load(path, encoding="utf-8")
     is_ass = path.suffix.lower() == ".ass"
 
@@ -318,6 +342,8 @@ async def process_subtitle(path: Path, llm: LLM, src_lang: str, tgt_lang: str, n
 
 
     banner(f"Proceso iniciado, Modelo usado: {MODEL_NAME}")
+    # Construye contexto de narrativa a partir del nombre del archivo
+    narrative = derive_narrative_from_filename(path)
     translator = TranslatorAgent(llm, narrative)
     validator  = ValidatorAgent(translator)
 
@@ -402,10 +428,8 @@ async def main():
     # Asegurar carpeta de trabajo única
     SUBS_DIR.mkdir(parents=True, exist_ok=True)
 
-    auto = ask("¿Deseas usar el modo automático? (acepta todos los valores por defecto) [y/n]", "n").lower().startswith("y")
-    narrative = "Una historia con diálogos naturales y estilo narrativo neutral."
-    if not auto:
-        narrative = ask("Describe brevemente la obra (serie, película, etc.) y su tono general", narrative)
+    # Contexto de la obra: ahora se infiere automáticamente del nombre del archivo.
+    # Ya no se solicita descripción manual al usuario.
 
     files = gather_files(SUBS_DIR)
     if not files:
@@ -415,7 +439,10 @@ async def main():
 
 
     # Primero preguntar el idioma destino para filtrar posibles ya traducidos
-    tgt_lang = ask("¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. 'es-419')", "es-419").strip()
+    tgt_lang = ask(
+        f"¿A qué idioma deseas traducir los subtítulos? (código ISO, ej. {color_lang('es-419')})",
+        "es-419"
+    ).strip()
 
     # Filtrar archivos que aparentan ya estar traducidos al destino seleccionado
     def looks_translated(p: Path) -> bool:
@@ -423,7 +450,7 @@ async def main():
         return p.name.endswith(f".{tgt_lang}{p.suffix}")
     files = [f for f in files if not looks_translated(f)]
     if not files:
-        console.print(f"[yellow]No hay archivos fuente por procesar en {SUBS_DIR} (ya existen traducciones a {tgt_lang}).[/]")
+        console.print(f"[yellow]No hay archivos fuente por procesar en {SUBS_DIR} (ya existen traducciones a {color_lang(tgt_lang)}).[/]")
         return
 
     console.print("\n[bold]Archivo(s) a procesar:[/]")
@@ -433,7 +460,10 @@ async def main():
     # Detección de idioma fuente usando el primer archivo post-filtrado
     sample_text = "".join([ev.plaintext for ev in pysubs2.load(files[0], encoding="utf-8") if ev.type=="Dialogue"])[:2000]
     src_guess = quick_lang_detect(sample_text)
-    src_ans = ask(f"Idioma detectado en el primer archivo: {src_guess}. ¿Es correcto? (s/n o escribe el código ISO)", "s")
+    src_ans = ask(
+        f"Idioma detectado en el primer archivo: {color_lang(src_guess)}. ¿Es correcto? (s/n o escribe el código ISO)",
+        "s"
+    )
     if src_ans.lower() not in {"s","si","sí","y","yes"}:
         src_lang = src_ans.strip() or src_guess
     else:
@@ -445,7 +475,7 @@ async def main():
     llm = LLM(os.getenv("CEREBRAS_API_KEY"), MODEL_NAME)
     for f in files:
         t0 = start_time()
-        await process_subtitle(f, llm, src_lang, tgt_lang, narrative)
+        await process_subtitle(f, llm, src_lang, tgt_lang)
         dt = start_time() - t0
         console.print(f"[bold cyan]⏱ Tiempo {f.name}:[/] [green]{fmt_duration(dt)}[/]")
 
