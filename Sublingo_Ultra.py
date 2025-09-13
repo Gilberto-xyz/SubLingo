@@ -29,7 +29,7 @@ from __future__ import annotations
 import os, re, sys, asyncio, argparse
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rich.console import Console
 from rich.panel import Panel
@@ -157,6 +157,7 @@ class LLMClient:
     model: str
     api_key: Optional[str] = None
     reasoning: Optional[str] = None  # none|low|medium|high (solo cerebras si el modelo soporta)
+    _client: object = field(default=None, init=False, repr=False)
 
     def _ensure_key(self):
         if self.provider == "groq":
@@ -175,80 +176,90 @@ class LLMClient:
                 " - PowerShell (sesión actual): $env:CEREBRAS_API_KEY=\"sk-XXX\"\n"
                 " - Persistente: setx CEREBRAS_API_KEY \"sk-XXX\""
             )
-        key = self.api_key or os.getenv(key_env, "")
+        key = (self.api_key or os.getenv(key_env, "")).strip().strip('"').strip("'")
         if not key:
             console.print(f"[yellow]No encontré {key_env}. Puedes pegarla ahora (solo para esta ejecución).[/]")
             pasted = ask(f"Clave {key_env}", "")
             if pasted:
+                pasted = pasted.strip().strip('"').strip("'")
                 os.environ[key_env] = pasted
                 key = pasted
         if not key:
             raise SystemExit(missing_msg)
         self.api_key = key
 
-    async def complete(self, prompt: str, temperature: float=0.2, max_tokens: int=4096) -> str:
+    def _get_client(self):
+        """Crea y reutiliza el cliente del proveedor para evitar overhead por llamada."""
         self._ensure_key()
-        env_max = os.getenv("SUBLINGO_MAX_TOKENS")
-        max_comp = int(env_max) if env_max else max_tokens
-
+        if self._client is not None:
+            return self._client
         if self.provider == "groq":
-            # Import diferido para no requerirlo si no se usa
             try:
                 from groq import Groq
             except Exception:
                 raise SystemExit("[ERROR] Instala 'groq' (pip install groq)")
-            client = Groq(api_key=self.api_key)
+            self._client = Groq(api_key=self.api_key)
+        else:
+            try:
+                from cerebras.cloud.sdk import Cerebras
+            except Exception:
+                raise SystemExit("[ERROR] Instala 'cerebras-cloud-sdk' (pip install cerebras-cloud-sdk)")
+            self._client = Cerebras(api_key=self.api_key)
+        return self._client
+
+    async def complete(self, prompt: str, temperature: float=0.2, max_tokens: int=4096, stream: Optional[bool]=None) -> str:
+        self._ensure_key()
+        env_max = os.getenv("SUBLINGO_MAX_TOKENS")
+        max_comp = int(env_max) if env_max else max_tokens
+        use_stream = (stream if stream is not None else (os.getenv("SUBLINGO_STREAM", "1") != "0"))
+
+        if self.provider == "groq":
+            client = self._get_client()
 
             def collect():
                 chunks: List[str] = []
                 kwargs = dict(
                     messages=[{"role": "system", "content": ""}, {"role": "user", "content": prompt}],
                     model=self.model,
-                    stream=True,
+                    stream=use_stream,
                     temperature=temperature,
-                    max_completion_tokens=max_comp,
+                    max_tokens=max_comp,
                     top_p=1,
                 )
                 try:
-                    iterator = client.chat.completions.create(**kwargs)
-                except Exception:
-                    # Fallback sin stream
-                    resp = client.chat.completions.create(
-                        messages=kwargs["messages"],
-                        model=self.model,
-                        temperature=temperature,
-                        max_completion_tokens=max_comp,
-                        top_p=1,
-                        stream=False,
-                    )
-                    return resp.choices[0].message.content or ""
-                try:
-                    for ch in iterator:
-                        d = ch.choices[0].delta.content
-                        if d:
-                            chunks.append(d)
+                    if use_stream:
+                        iterator = client.chat.completions.create(**kwargs)
+                        for ch in iterator:
+                            choice = ch.choices[0]
+                            d = None
+                            if hasattr(choice, 'delta') and getattr(choice.delta, 'content', None):
+                                d = choice.delta.content
+                            elif hasattr(choice, 'message') and getattr(choice.message, 'content', None):
+                                d = choice.message.content
+                            if d:
+                                chunks.append(d)
+                        return "".join(chunks)
+                    else:
+                        resp = client.chat.completions.create(**kwargs)
+                        return resp.choices[0].message.content or ""
                 except Exception as e:
-                    if '429' in str(e).lower() or 'rate' in str(e).lower():
+                    msg = str(e)
+                    if '429' in msg.lower() or 'rate' in msg.lower():
                         raise QuotaExceededError("Groq: cuota/límite de tasa alcanzado (429).") from e
                     raise
-                return "".join(chunks)
 
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, collect)
 
         # provider == cerebras
-        try:
-            from cerebras.cloud.sdk import Cerebras
-        except Exception:
-            raise SystemExit("[ERROR] Instala 'cerebras-cloud-sdk' (pip install cerebras-cloud-sdk)")
-        client = Cerebras(api_key=self.api_key)
+        client = self._get_client()
 
         def collect_cb():
             chunks: List[str] = []
             kwargs = dict(
                 messages=[{"role": "system", "content": ""}, {"role": "user", "content": prompt}],
                 model=self.model,
-                stream=True,
+                stream=use_stream,
                 temperature=temperature,
                 max_completion_tokens=max_comp,
                 top_p=1,
@@ -257,27 +268,62 @@ class LLMClient:
             if self.reasoning and str(self.reasoning).lower() != "none":
                 kwargs["reasoning_effort"] = self.reasoning
             try:
-                iterator = client.chat.completions.create(**kwargs)
+                if use_stream:
+                    iterator = client.chat.completions.create(**kwargs)
+                else:
+                    resp = client.chat.completions.create(**kwargs)
+                    return resp.choices[0].message.content or ""
             except Exception as e:
                 # Reintento sin reasoning por compatibilidad
                 kwargs.pop("reasoning_effort", None)
                 try:
-                    iterator = client.chat.completions.create(**kwargs)
+                    if use_stream:
+                        iterator = client.chat.completions.create(**kwargs)
+                    else:
+                        resp = client.chat.completions.create(**kwargs)
+                        return resp.choices[0].message.content or ""
                 except Exception as e2:
-                    if 'RateLimitError' in e2.__class__.__name__ or '429' in str(e2):
+                    name = e2.__class__.__name__
+                    msg = str(e2)
+                    if 'AuthenticationError' in name or '401' in msg or 'Wrong API Key' in msg:
+                        raise SystemExit(
+                            "[ERROR] CEREBRAS_API_KEY inválida (401).\n"
+                            "Verifica tu clave y vuelve a ejecutar.\n"
+                            "PowerShell (solo sesión actual): $env:CEREBRAS_API_KEY=\"sk-...\"\n"
+                            "Persistente: setx CEREBRAS_API_KEY \"sk-...\""
+                        ) from e2
+                    if 'RateLimitError' in name or '429' in msg:
                         raise QuotaExceededError("Cerebras: cuota diaria de tokens excedida o límite de tasa.") from e2
                     raise
 
-            try:
-                for ch in iterator:
-                    d = ch.choices[0].delta.content
-                    if d:
-                        chunks.append(d)
-            except Exception as e:
-                if 'RateLimitError' in e.__class__.__name__ or '429' in str(e):
-                    raise QuotaExceededError("Cerebras: cuota diaria de tokens excedida o límite de tasa.") from e
-                raise
-            return "".join(chunks)
+            if use_stream:
+                try:
+                    for ch in iterator:
+                        choice = ch.choices[0]
+                        d = None
+                        if hasattr(choice, 'delta') and getattr(choice.delta, 'content', None):
+                            d = choice.delta.content
+                        elif hasattr(choice, 'message') and getattr(choice.message, 'content', None):
+                            d = choice.message.content
+                        if d:
+                            chunks.append(d)
+                except Exception as e:
+                    name = e.__class__.__name__
+                    msg = str(e)
+                    if 'AuthenticationError' in name or '401' in msg or 'Wrong API Key' in msg:
+                        raise SystemExit(
+                            "[ERROR] CEREBRAS_API_KEY inválida (401).\n"
+                            "Verifica tu clave y vuelve a ejecutar.\n"
+                            "PowerShell (solo sesión actual): $env:CEREBRAS_API_KEY=\"sk-...\"\n"
+                            "Persistente: setx CEREBRAS_API_KEY \"sk-...\""
+                        ) from e
+                    if 'RateLimitError' in name or '429' in msg:
+                        raise QuotaExceededError("Cerebras: cuota diaria de tokens excedida o límite de tasa.") from e
+                    raise
+                return "".join(chunks)
+
+            # no-stream ya retornó arriba
+            return ""
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, collect_cb)
@@ -312,9 +358,44 @@ interjecciones tipo 'Huh?', 'Eek...', y rótulos como 'INTERNET & COMIC CAFE' se
         numbered = [f"[[{i}]] {b}" for i, b in enumerate(blocks, 1)]
         prompt = self._rules(src, tgt, aggressive) + f"\nBLOQUES:\n{os.linesep.join(numbered)}\n\nResponde con [[id]] <texto>."
         out = await self.llm.complete(prompt)
-        patt = re.compile(r'^\s*\[\[(\d+)\]\]\s*(.*?)(?=\n\[\[|\Z)', re.M | re.S)
+
+        # Debug opcional: guarda prompt y salida cruda
+        if os.getenv("SUBLINGO_DEBUG", "0") != "0":
+            try:
+                dbg_dir = Path.cwd() / "DEBUG"
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                ts = int(time.time()*1000)
+                (dbg_dir / f"batch_{ts}.prompt.txt").write_text(prompt, encoding="utf-8")
+                (dbg_dir / f"batch_{ts}.out.txt").write_text(out or "", encoding="utf-8")
+            except Exception:
+                pass
+
+        # 1) Parse con IDs [[n]]
+        patt = re.compile(r'^\s*\[\[(\d+)\]\]\s*(.*?)(?=\n\s*\[\[|\Z)', re.M | re.S)
         mapping = {int(m.group(1)): m.group(2).strip() for m in patt.finditer(out)}
-        return [mapping.get(i, "").strip() for i in range(1, len(blocks) + 1)]
+        if mapping:
+            return [mapping.get(i, "").strip() for i in range(1, len(blocks) + 1)]
+
+        # 2) Fallback: línea a línea en orden
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        if len(lines) >= len(blocks):
+            return [lines[i] for i in range(len(blocks))]
+
+        # 3) Reintento con stream explícito
+        try:
+            out2 = await self.llm.complete(prompt, stream=True)
+            mapping2 = {int(m.group(1)): m.group(2).strip() for m in patt.finditer(out2)}
+            if mapping2:
+                return [mapping2.get(i, "").strip() for i in range(1, len(blocks) + 1)]
+            lines2 = [ln.strip() for ln in out2.strip().splitlines() if ln.strip()]
+            if len(lines2) >= len(blocks):
+                return [lines2[i] for i in range(len(blocks))]
+        except Exception:
+            pass
+
+        # 4) Fallback mínimo: devuelve lo que haya y rellena
+        lines.extend([""] * (len(blocks) - len(lines)))
+        return lines
 
 
 @dataclass
@@ -333,20 +414,35 @@ class ValidatorAgent:
         for i,(s,o) in enumerate(zip(src_blocks,out_blocks)):
             if self._needs_fix(s,o): idxs.append(i); blocks.append(s)
         return idxs, blocks
-    async def repair(self, src_blocks: List[str], out_blocks: List[str], src: str, tgt: str) -> List[str]:
+    async def repair(self, src_blocks: List[str], out_blocks: List[str], src: str, tgt: str, concurrency: int = 1) -> List[str]:
         idxs, blocks = self.find_issues(src_blocks, out_blocks)
         if not blocks: return out_blocks
         batch_size = int(os.getenv("SUBLINGO_BATCH", 60))
         sleep_s = float(os.getenv("SUBLINGO_SLEEP", 0.15))
-        fix = []
+
+        fixed_all: List[str] = [""] * len(blocks)
+        ranges: List[Tuple[int, int]] = []
         for i in range(0, len(blocks), batch_size):
-            part = blocks[i:i+batch_size]
-            fixed = await self.translator.translate(part, src, tgt, aggressive=True)
-            fix.extend(fixed)
-            if i + batch_size < len(blocks):
-                await asyncio.sleep(sleep_s)
-        for j, val in zip(idxs, fix):
-            out_blocks[j] = val.strip()
+            j = min(i + batch_size, len(blocks))
+            ranges.append((i, j))
+
+        async def run_fix(i: int, j: int, sem: asyncio.Semaphore):
+            async with sem:
+                part = blocks[i:j]
+                repaired = await self.translator.translate(part, src, tgt, aggressive=True)
+                fixed_all[i:j] = repaired
+
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+        if concurrency <= 1:
+            for i, j in ranges:
+                await run_fix(i, j, sem)
+                if j < len(blocks):
+                    await asyncio.sleep(sleep_s)
+        else:
+            await asyncio.gather(*[run_fix(i, j, sem) for (i, j) in ranges])
+
+        for j, val in zip(idxs, fixed_all):
+            out_blocks[j] = (val or "").strip()
         return out_blocks
 
 
@@ -371,6 +467,7 @@ async def process_subtitle(
     preview: bool=False,
     only_styles: Optional[set] = None,
     skip_styles: Optional[set] = None,
+    concurrency: int = 1,
 ):
     import pysubs2  # aseguramos import local; se valida al inicio de main
     subs = pysubs2.load(path, encoding="utf-8")
@@ -471,32 +568,55 @@ async def process_subtitle(
                 src_blocks.extend(clean)
 
     batch_size = int(os.getenv("SUBLINGO_BATCH", 60))
-    sleep_s   = float(os.getenv("SUBLINGO_SLEEP", 0.15))
+    sleep_s   = float(os.getenv("SUBLINGO_SLEEP", 0.15))  # usado solo si concurrency=1
 
     narrative = derive_narrative_from_filename(path)
     translator = TranslatorAgent(llm, narrative)
     validator  = ValidatorAgent(translator)
 
-    out_blocks: List[str] = []
+    out_blocks: List[str] = [""] * len(src_blocks)
+    ranges: List[Tuple[int, int]] = []
+    for i in range(0, len(src_blocks), batch_size):
+        j = min(i + batch_size, len(src_blocks))
+        ranges.append((i, j))
+
+    async def run_batch(i: int, j: int, sem: asyncio.Semaphore):
+        async with sem:
+            batch = src_blocks[i:j]
+            out = await translator.translate(batch, src_lang, tgt_lang, aggressive=False)
+            out_blocks[i:j] = out
+            return batch, out
+
     with Progress(TextColumn("[bold]lotes[/]"), BarColumn(), TimeElapsedColumn(), TimeRemainingColumn(), console=console) as bar:
         t = bar.add_task("traduciendo", total=len(src_blocks))
-        for i in range(0, len(src_blocks), batch_size):
-            batch = src_blocks[i:i+batch_size]
-            out = await translator.translate(batch, src_lang, tgt_lang, aggressive=False)
-            out_blocks.extend(out)
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+        if concurrency <= 1:
+            # Secuencial (comportamiento previo, mantiene pausas entre lotes)
+            for i, j in ranges:
+                batch, out = await run_batch(i, j, sem)
+                if preview:
+                    previews = []
+                    for s, o in zip(batch[:4], out[:4]):
+                        previews.append(f"- {trunc(s, 40)} -> {trunc((o or ''), 40)}")
+                    if previews:
+                        bar.console.print("\n".join(previews))
+                bar.update(t, advance=(j - i))
+                if j < len(src_blocks):
+                    await asyncio.sleep(sleep_s)
+        else:
+            # Paralelo controlado por semáforo
+            tasks = [asyncio.create_task(run_batch(i, j, sem)) for (i, j) in ranges]
+            for coro in asyncio.as_completed(tasks):
+                batch, out = await coro
+                if preview:
+                    previews = []
+                    for s, o in zip(batch[:4], out[:4]):
+                        previews.append(f"- {trunc(s, 40)} -> {trunc((o or ''), 40)}")
+                    if previews:
+                        bar.console.print("\n".join(previews))
+                bar.update(t, advance=len(batch))
 
-            if preview:
-                previews = []
-                for s, o in zip(batch[:4], out[:4]):
-                    previews.append(f"- {trunc(s, 40)} -> {trunc((o or ''), 40)}")
-                if previews:
-                    bar.console.print("\n".join(previews))
-
-            bar.update(t, advance=len(batch))
-            if i + batch_size < len(src_blocks):
-                await asyncio.sleep(sleep_s)
-
-    out_blocks = await validator.repair(src_blocks, out_blocks, src_lang, tgt_lang)
+    out_blocks = await validator.repair(src_blocks, out_blocks, src_lang, tgt_lang, concurrency=concurrency)
 
     if is_ass:
         for idx_event, token_objs in assembly_ass:
@@ -579,6 +699,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--dir", default=os.getenv("SUBS_BULK_DIR", "SUBS_BULK"), help="Carpeta de subtítulos de entrada")
     p.add_argument("--batch", type=int, default=int(os.getenv("SUBLINGO_BATCH", 60)), help="Tamaño de lote")
     p.add_argument("--sleep", type=float, default=float(os.getenv("SUBLINGO_SLEEP", 0.15)), help="Pausa entre lotes (s)")
+    p.add_argument("--concurrency", type=int, default=int(os.getenv("SUBLINGO_CONCURRENCY", "0") or 0),
+                   help="Número de lotes en paralelo (0=auto)")
     p.add_argument("--razonamiento", "--reasoning", default=os.getenv("SUBLINGO_REASONING", "none"),
                    help="Razonamiento (none|low|medium|high) – solo Cerebras si aplica")
     p.add_argument("--p", "--proceso", "--t", dest="preview", action="store_true", help="Mostrar vista de proceso (previews)")
@@ -589,6 +711,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Omitir estos estilos (coma-separados), ej: 'Signs,OP Romaji'")
     p.add_argument("--sin-filtro", dest="disable_filter", action="store_true",
                    help="Desactiva el filtro inteligente de estilos (por defecto activado)")
+    p.add_argument("--debug", action="store_true", help="Guardar prompts y respuestas crudas para diagnóstico")
     return p.parse_args(argv)
 
 
@@ -600,6 +723,10 @@ async def main(argv: Optional[List[str]] = None):
     os.environ["SUBLINGO_SLEEP"] = str(args.sleep)
     os.environ["SUBS_BULK_DIR"] = args.dir
     os.environ["SUBLINGO_REASONING"] = str(args.razonamiento)
+    if args.debug:
+        os.environ["SUBLINGO_DEBUG"] = "1"
+    if args.concurrency:
+        os.environ["SUBLINGO_CONCURRENCY"] = str(args.concurrency)
 
     # Validar dependencia común
     try:
@@ -670,6 +797,16 @@ async def main(argv: Optional[List[str]] = None):
     reasoning = args.razonamiento if provider == "cerebras" else None
     llm = LLMClient(provider=provider, model=model_id, reasoning=reasoning)
 
+    # Concurrencia por defecto: Cerebras tolera más, Groq más conservador
+    if args.concurrency and args.concurrency > 0:
+        concurrency = args.concurrency
+    else:
+        concurrency = 1
+
+    # Para concurrencia >1, desactivar stream para mayor robustez de SDKs
+    if concurrency > 1:
+        os.environ["SUBLINGO_STREAM"] = "0"
+
     console.print(Panel.fit(f"Proceso iniciado, Modelo usado: {model_id}\nProveedor: {provider}", border_style="magenta"))
 
     total_t0 = start_time()
@@ -688,6 +825,7 @@ async def main(argv: Optional[List[str]] = None):
                 preview=args.preview,
                 only_styles=only_styles_set,
                 skip_styles=skip_styles_set,
+                concurrency=concurrency,
             )
             dt = start_time() - t0
             console.print(f"[bold cyan]⏱ Tiempo {f.name}:[/] [green]{fmt_duration(dt)}[/]")
