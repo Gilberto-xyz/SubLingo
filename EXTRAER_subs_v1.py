@@ -63,7 +63,7 @@ def scan_directory(path):
 
 
 def extract_subs(path, streams, idiomas_sel):
-    out_dir = os.path.join(path, 'subtitulos_extraidos')
+    out_dir = os.path.join(path, 'SUBS_BULK')
     os.makedirs(out_dir, exist_ok=True)
 
     ok, fail = 0, 0
