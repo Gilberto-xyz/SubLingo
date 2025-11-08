@@ -14,7 +14,7 @@ import os
 import json
 from collections import defaultdict
 
-VIDEO_EXTS = {'.mkv'}
+VIDEO_EXTS = {'.mkv', '.mp4', '.avi'}
 FFPROBE_FIELDS = 'stream=index,codec_type,codec_name:stream_tags=language'
 
 
