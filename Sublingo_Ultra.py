@@ -3,23 +3,25 @@
 """
 Sublingo Ultra – Traductor de subtítulos unificado
 --------------------------------------------------
-Unifica las variantes Kimi (Groq), GPT-OSS (Cerebras) y Llama (Cerebras)
+Unifica las variantes Gemini (Google), Kimi (Groq), GPT-OSS (Cerebras) y Llama (Cerebras)
 en un solo programa con selección de modelo/proveedor y modo de vista
 de proceso opcional.
 
 Características:
 - Soporta SRT y ASS (conserva tags y prefijos de diálogo).
-- Selección de modelo por alias: kimi, gpt-oss, llama31-8b, llama-scout.
-- Proveedor automático (Groq/Cerebras) según el modelo elegido.
+- Selección de modelo por alias: gemini, kimi, gpt-oss, llama31-8b, llama-scout.
+- Proveedor automático (Gemini/Groq/Cerebras) según el modelo elegido.
 - Razonamiento opcional (Cerebras) vía --razonamiento o env SUBLINGO_REASONING.
 - Vista de proceso (previews) con --p / --proceso / --t (desactivado por defecto).
 
 Requisitos (según proveedor usado):
+- Gemini: pip install google-generativeai ; export/set GEMINI_API_KEY
 - Groq: pip install groq ; export/set GROQ_API_KEY
 - Cerebras: pip install cerebras-cloud-sdk ; export/set CEREBRAS_API_KEY
 - Común: pip install pysubs2 rich python-dotenv (opcional .env)
 
 Ejemplos:
+  python Sublingo_Ultra.py -m gemini --tgt es-419 --p
   python Sublingo_Ultra.py -m kimi --tgt es-419 --p
   python Sublingo_Ultra.py -m gpt-oss --razonamiento none --tgt es-419
   python Sublingo_Ultra.py -m llama31-8b --tgt pt-BR --dir SUBS_BULK
@@ -143,6 +145,7 @@ def fix_es_ass_idioms(line: str) -> str:
 # --------------------------- Cliente LLM unificado ---------------------------
 SUPPORTED_ALIASES: Dict[str, Dict[str, str]] = {
     # alias: {provider, model}
+    "gemini":    {"provider": "gemini",   "model": "gemini-2.0-flash-lite"},
     "kimi":      {"provider": "groq",     "model": "moonshotai/kimi-k2-instruct"},
     "gpt-oss":   {"provider": "cerebras", "model": "gpt-oss-120b"},
     # Llama 3.1 8B (Cerebras)
@@ -151,9 +154,27 @@ SUPPORTED_ALIASES: Dict[str, Dict[str, str]] = {
     "llama-scout": {"provider": "cerebras", "model": "llama-4-scout-17b-16e-instruct"},
 }
 
+def _env_has(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
+
+def infer_provider_from_model(model_id: str) -> str:
+    mid = model_id.strip().lower()
+    if "/" in mid:
+        return "groq"
+    if mid.startswith("gemini"):
+        return "gemini"
+    return "cerebras"
+
+def pick_default_provider_model() -> Tuple[str, str]:
+    if _env_has("GEMINI_API_KEY"):
+        return "gemini", "gemini-2.0-flash-lite"
+    if _env_has("GROQ_API_KEY"):
+        return "groq", "moonshotai/kimi-k2-instruct"
+    return "cerebras", "gpt-oss-120b"
+
 @dataclass
 class LLMClient:
-    provider: str               # "groq" | "cerebras"
+    provider: str               # "gemini" | "groq" | "cerebras"
     model: str
     api_key: Optional[str] = None
     reasoning: Optional[str] = None  # none|low|medium|high (solo cerebras si el modelo soporta)
@@ -167,6 +188,14 @@ class LLMClient:
                 " - Crea .env: GROQ_API_KEY=gsk-XXX\n"
                 " - PowerShell (sesión actual): $env:GROQ_API_KEY=\"gsk-XXX\"\n"
                 " - Persistente: setx GROQ_API_KEY \"gsk-XXX\""
+            )
+        elif self.provider == "gemini":
+            key_env = "GEMINI_API_KEY"
+            missing_msg = (
+                "[ERROR] Falta GEMINI_API_KEY. Opciones:\n"
+                " - Crea .env: GEMINI_API_KEY=tu_api_key\n"
+                " - PowerShell (sesión actual): $env:GEMINI_API_KEY=\"tu_api_key\"\n"
+                " - Persistente: setx GEMINI_API_KEY \"tu_api_key\""
             )
         else:
             key_env = "CEREBRAS_API_KEY"
@@ -199,6 +228,13 @@ class LLMClient:
             except Exception:
                 raise SystemExit("[ERROR] Instala 'groq' (pip install groq)")
             self._client = Groq(api_key=self.api_key)
+        elif self.provider == "gemini":
+            try:
+                import google.generativeai as genai
+            except Exception:
+                raise SystemExit("[ERROR] Instala 'google-generativeai' (pip install google-generativeai)")
+            genai.configure(api_key=self.api_key)
+            self._client = genai.GenerativeModel(self.model)
         else:
             try:
                 from cerebras.cloud.sdk import Cerebras
@@ -251,6 +287,42 @@ class LLMClient:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, collect)
 
+        if self.provider == "gemini":
+            client = self._get_client()
+
+            def collect_gemini():
+                chunks: List[str] = []
+                generation_config = {
+                    "temperature": temperature,
+                    "max_output_tokens": max_comp,
+                    "top_p": 1,
+                }
+                try:
+                    if use_stream:
+                        iterator = client.generate_content(prompt, generation_config=generation_config, stream=True)
+                        for ch in iterator:
+                            text = getattr(ch, "text", None)
+                            if text:
+                                chunks.append(text)
+                        return "".join(chunks)
+                    resp = client.generate_content(prompt, generation_config=generation_config)
+                    return getattr(resp, "text", "") or ""
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "401" in msg or "403" in msg or "permission" in msg or "unauthorized" in msg:
+                        raise SystemExit(
+                            "[ERROR] GEMINI_API_KEY inválida (401/403).\n"
+                            "Verifica tu clave y vuelve a ejecutar.\n"
+                            "PowerShell (solo sesión actual): $env:GEMINI_API_KEY=\"...\"\n"
+                            "Persistente: setx GEMINI_API_KEY \"...\""
+                        ) from e
+                    if "429" in msg or "quota" in msg or "rate" in msg:
+                        raise QuotaExceededError("Gemini: cuota/límite de tasa alcanzado (429).") from e
+                    raise
+
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, collect_gemini)
+
         # provider == cerebras
         client = self._get_client()
 
@@ -292,6 +364,12 @@ class LLMClient:
                             "PowerShell (solo sesión actual): $env:CEREBRAS_API_KEY=\"sk-...\"\n"
                             "Persistente: setx CEREBRAS_API_KEY \"sk-...\""
                         ) from e2
+                    if 'payment_required' in msg or '402' in msg:
+                        raise SystemExit(
+                            "[ERROR] Cerebras requiere pago para acceder a este recurso (402).\n"
+                            "Revisa tu pestaña de facturación o usa otro proveedor.\n"
+                            "Ejemplo: --proveedor gemini --modelo gemini"
+                        ) from e2
                     if 'RateLimitError' in name or '429' in msg:
                         raise QuotaExceededError("Cerebras: cuota diaria de tokens excedida o límite de tasa.") from e2
                     raise
@@ -316,6 +394,12 @@ class LLMClient:
                             "Verifica tu clave y vuelve a ejecutar.\n"
                             "PowerShell (solo sesión actual): $env:CEREBRAS_API_KEY=\"sk-...\"\n"
                             "Persistente: setx CEREBRAS_API_KEY \"sk-...\""
+                        ) from e
+                    if 'payment_required' in msg or '402' in msg:
+                        raise SystemExit(
+                            "[ERROR] Cerebras requiere pago para acceder a este recurso (402).\n"
+                            "Revisa tu pestaña de facturación o usa otro proveedor.\n"
+                            "Ejemplo: --proveedor gemini --modelo gemini"
                         ) from e
                     if 'RateLimitError' in name or '429' in msg:
                         raise QuotaExceededError("Cerebras: cuota diaria de tokens excedida o límite de tasa.") from e
@@ -690,7 +774,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sublingo Ultra – Traductor unificado")
     p.add_argument("--modelo", "-m", default=os.getenv("SUBLINGO_MODEL", "gpt-oss"),
                    help="Alias de modelo: " + ", ".join(SUPPORTED_ALIASES.keys()) + " o id explícito")
-    p.add_argument("--proveedor", "--provider", choices=["auto","groq","cerebras"], default=os.getenv("SUBLINGO_PROVIDER", "auto"),
+    p.add_argument("--proveedor", "--provider", choices=["auto","gemini","groq","cerebras"], default=os.getenv("SUBLINGO_PROVIDER", "auto"),
                    help="Proveedor LLM (auto por defecto)")
     p.add_argument("--model-id", default=os.getenv("SUBLINGO_MODEL_ID", ""),
                    help="Model ID explícito (anula el alias si se provee)")
@@ -778,20 +862,38 @@ async def main(argv: Optional[List[str]] = None):
     model_alias = (args.modelo or "gpt-oss").strip()
     provider = args.proveedor
     model_id = args.model_id.strip()
+    user_set_model = any(a in {"-m", "--modelo"} for a in sys.argv)
+    user_set_model_id = "--model-id" in sys.argv
+    user_set_provider = any(a in {"--proveedor", "--provider"} for a in sys.argv)
+    env_model_set = _env_has("SUBLINGO_MODEL")
+    env_model_id_set = _env_has("SUBLINGO_MODEL_ID")
+    env_provider_set = _env_has("SUBLINGO_PROVIDER")
 
     if model_id:
         # Si se entrega id explícito, se requiere proveedor explícito o deducimos por heurística
         if provider == "auto":
-            provider = "groq" if "/" in model_id else "cerebras"
+            provider = infer_provider_from_model(model_id)
     else:
-        if model_alias in SUPPORTED_ALIASES:
+        auto_default = (
+            provider == "auto"
+            and not user_set_model
+            and not user_set_model_id
+            and not user_set_provider
+            and not env_model_set
+            and not env_model_id_set
+            and not env_provider_set
+        )
+        if auto_default:
+            provider, model_id = pick_default_provider_model()
+            model_alias = model_id
+        elif model_alias in SUPPORTED_ALIASES:
             provider = SUPPORTED_ALIASES[model_alias]["provider"] if provider == "auto" else provider
             model_id = SUPPORTED_ALIASES[model_alias]["model"]
         else:
             # Permitir alias desconocidos como id directo
             model_id = model_alias
             if provider == "auto":
-                provider = "groq" if "/" in model_id else "cerebras"
+                provider = infer_provider_from_model(model_id)
 
     # Construir cliente LLM
     reasoning = args.razonamiento if provider == "cerebras" else None
@@ -834,6 +936,14 @@ async def main(argv: Optional[List[str]] = None):
             console.print(Panel(
                 "Cuota de tokens/límites de tasa en Groq excedidos (429).\n"
                 "Opciones: espera el reinicio diario, reduce consumo con\n"
+                "SUBLINGO_MAX_TOKENS=2048-4096, SUBLINGO_BATCH=30-60;\n"
+                "o usa otra clave/modelo.",
+                title="Límite de tokens alcanzado", border_style="red", expand=False
+            ))
+        elif provider == "gemini":
+            console.print(Panel(
+                "Cuota/límite de tasa en Gemini excedidos (429).\n"
+                "Opciones: espera el reinicio, reduce consumo con\n"
                 "SUBLINGO_MAX_TOKENS=2048-4096, SUBLINGO_BATCH=30-60;\n"
                 "o usa otra clave/modelo.",
                 title="Límite de tokens alcanzado", border_style="red", expand=False
